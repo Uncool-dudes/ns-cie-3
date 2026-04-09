@@ -18,10 +18,33 @@ import (
 func main() {
 	addr := flag.String("listen", ":5000", "relay listen address")
 	logFile := flag.String("log", "", "path to log file (default: stdout only)")
+	identityPath := flag.String("identity", "relay-identity.key", "path to relay's Ed25519 identity key file")
+	peerAKeyHex := flag.String("peer-a-key", "", "peer A's identity public key (hex) — required")
+	peerBKeyHex := flag.String("peer-b-key", "", "peer B's identity public key (hex) — required")
 	flag.Parse()
+
+	if *peerAKeyHex == "" || *peerBKeyHex == "" {
+		fmt.Fprintln(os.Stderr, "usage: relay --peer-a-key <hex> --peer-b-key <hex> [--listen :5000] [--log file]")
+		os.Exit(1)
+	}
 
 	log := buildLogger(*logFile)
 	defer log.Sync() //nolint:errcheck
+
+	identity, err := appcrypto.LoadOrCreateIdentityKey(*identityPath)
+	if err != nil {
+		log.Fatal("identity key", zap.Error(err))
+	}
+	log.Info("relay identity", zap.String("public_key", appcrypto.PublicKeyHex(identity)))
+
+	peerAIdentity, err := appcrypto.ParsePublicKey(*peerAKeyHex)
+	if err != nil {
+		log.Fatal("--peer-a-key invalid", zap.Error(err))
+	}
+	peerBIdentity, err := appcrypto.ParsePublicKey(*peerBKeyHex)
+	if err != nil {
+		log.Fatal("--peer-b-key invalid", zap.Error(err))
+	}
 
 	log.Info("relay starting", zap.String("addr", *addr))
 
@@ -56,11 +79,11 @@ func main() {
 	chB := make(chan handshakeResult, 1)
 
 	go func() {
-		key, err := appcrypto.Handshake(connA)
+		key, err := appcrypto.Handshake(connA, identity, peerAIdentity)
 		chA <- handshakeResult{key, err}
 	}()
 	go func() {
-		key, err := appcrypto.Handshake(connB)
+		key, err := appcrypto.Handshake(connB, identity, peerBIdentity)
 		chB <- handshakeResult{key, err}
 	}()
 
@@ -77,12 +100,9 @@ func main() {
 
 	done := make(chan struct{}, 2)
 
-	// A → B
-	go relay(log, "A", "B", connA, connB, resA.key, resB.key, done)
-	// B → A
-	go relay(log, "B", "A", connB, connA, resB.key, resA.key, done)
+	go relayDir(log, "A", "B", connA, connB, resA.key, resB.key, done)
+	go relayDir(log, "B", "A", connB, connA, resB.key, resA.key, done)
 
-	// Block until one direction closes.
 	<-done
 	log.Info("a relay direction closed — shutting down")
 	connA.Close()
@@ -91,9 +111,7 @@ func main() {
 	log.Info("relay done")
 }
 
-// relay reads encrypted frames from src (using srcKey), logs the plaintext,
-// then re-encrypts with dstKey and writes to dst.
-func relay(log *zap.Logger, srcName, dstName string, src, dst net.Conn, srcKey, dstKey [32]byte, done chan<- struct{}) {
+func relayDir(log *zap.Logger, srcName, dstName string, src, dst net.Conn, srcKey, dstKey [32]byte, done chan<- struct{}) {
 	defer func() { done <- struct{}{} }()
 
 	log.Info("relay direction started",
@@ -118,7 +136,6 @@ func relay(log *zap.Logger, srcName, dstName string, src, dst net.Conn, srcKey, 
 				zap.ByteString("raw", plaintext),
 				zap.Error(err),
 			)
-			// Still forward the raw bytes re-encrypted so the peer isn't stuck.
 		} else {
 			log.Info("message",
 				zap.String("from", srcName),
@@ -132,10 +149,7 @@ func relay(log *zap.Logger, srcName, dstName string, src, dst net.Conn, srcKey, 
 
 		frame, err := appcrypto.Encrypt(dstKey, plaintext)
 		if err != nil {
-			log.Error("encrypt error",
-				zap.String("to", dstName),
-				zap.Error(err),
-			)
+			log.Error("encrypt error", zap.String("to", dstName), zap.Error(err))
 			return
 		}
 
