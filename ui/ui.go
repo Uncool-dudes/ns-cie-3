@@ -163,12 +163,18 @@ func (m Model) renderMessages() string {
 		return statusStyle.Render("  No messages yet.")
 	}
 
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+
 	var sb strings.Builder
 	for _, msg := range m.messages {
 		ts := timestampStyle.Render(msg.Time.Format("15:04"))
+		isMine := msg.Sender == m.username
 
 		var nameStyle lipgloss.Style
-		if msg.Sender == m.username {
+		if isMine {
 			nameStyle = senderStyle
 		} else {
 			nameStyle = otherStyle
@@ -177,8 +183,17 @@ func (m Model) renderMessages() string {
 		name := nameStyle.Render(msg.Sender)
 		content := bubbleStyle.Render(msg.Content)
 
-		sb.WriteString(fmt.Sprintf("%s %s  %s\n%s\n\n",
-			name, ts, "", content))
+		if isMine {
+			// Right-align: meta line and bubble pushed to the right
+			meta := fmt.Sprintf("%s %s", ts, name)
+			metaLine := lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(meta)
+			bubbleLine := lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(content)
+			sb.WriteString(metaLine + "\n" + bubbleLine + "\n\n")
+		} else {
+			// Left-align: name then timestamp, bubble below
+			meta := fmt.Sprintf("%s %s", name, ts)
+			sb.WriteString(meta + "\n" + content + "\n\n")
+		}
 	}
 
 	return sb.String()

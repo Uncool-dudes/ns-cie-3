@@ -5,76 +5,108 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
+	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.io/uncool-dudes/p2p-chat/chat"
-	appcrypto "github.io/uncool-dudes/p2p-chat/crypto"
 	"github.io/uncool-dudes/p2p-chat/p2p"
 	"github.io/uncool-dudes/p2p-chat/ui"
 )
+
+const reconnectDelay = 3 * time.Second
 
 func main() {
 	listen := flag.String("listen", "", "address to listen on (e.g. :4242)")
 	connect := flag.String("connect", "", "peer address to connect to (e.g. 192.168.1.5:4242)")
 	name := flag.String("name", "you", "your display name")
-	identityPath := flag.String("identity", defaultIdentityPath(), "path to your Ed25519 identity key file")
-	peerKeyHex := flag.String("peer-key", "", "peer's identity public key (hex) — share yours with them first")
+	noEncrypt := flag.Bool("no-encrypt", false, "send raw plaintext — no key exchange, no encryption")
+	noDiffie := flag.Bool("no-diffie", false, "send AES key in plaintext instead of DH — traffic is encrypted but key is sniffable")
 	flag.Parse()
 
 	if *listen == "" && *connect == "" {
-		fmt.Fprintln(os.Stderr, "usage: p2p-chat --listen :4242 | --connect host:port [--name yourname] --peer-key <hex>")
-		os.Exit(1)
-	}
-	if *peerKeyHex == "" {
-		fmt.Fprintln(os.Stderr, "error: --peer-key is required (exchange identity keys with your peer first)")
+		fmt.Fprintln(os.Stderr, "usage: p2p-chat --listen :4242 | --connect host:port [--name yourname]")
 		os.Exit(1)
 	}
 
-	identity, err := appcrypto.LoadOrCreateIdentityKey(*identityPath)
-	if err != nil {
-		log.Fatalf("identity: %v", err)
+	mode := p2p.ModeEncrypted
+	switch {
+	case *noEncrypt:
+		mode = p2p.ModePlaintext
+	case *noDiffie:
+		mode = p2p.ModeNaiveKey
 	}
-	log.Printf("your identity key: %s", appcrypto.PublicKeyHex(identity))
 
-	peerIdentity, err := appcrypto.ParsePublicKey(*peerKeyHex)
-	if err != nil {
-		log.Fatalf("--peer-key: %v", err)
+	// dial returns a new session, retrying until it succeeds.
+	dial := func() *p2p.Session {
+		for {
+			var (
+				session *p2p.Session
+				err     error
+			)
+			if *listen != "" {
+				log.Printf("waiting for peer on %s ...", *listen)
+				session, err = p2p.Listen(*listen, mode)
+			} else {
+				log.Printf("connecting to %s ...", *connect)
+				session, err = p2p.Dial(*connect, mode)
+			}
+			if err != nil {
+				log.Printf("connection failed: %v — retrying in %s", err, reconnectDelay)
+				time.Sleep(reconnectDelay)
+				continue
+			}
+			switch mode {
+			case p2p.ModePlaintext:
+				log.Println("connected — plaintext mode")
+			case p2p.ModeNaiveKey:
+				log.Println("connected — naive key exchange (key sent in plaintext)")
+			default:
+				log.Println("connected — DH handshake complete, session encrypted")
+			}
+			return session
+		}
 	}
 
 	recv := make(chan chat.Message, 32)
 	send := make(chan chat.Message, 32)
 
-	var session *p2p.Session
+	var (
+		mu      sync.Mutex
+		session = dial()
+	)
 
-	if *listen != "" {
-		log.Printf("waiting for peer on %s ...", *listen)
-		session, err = p2p.Listen(*listen, identity, peerIdentity)
-	} else {
-		log.Printf("connecting to %s ...", *connect)
-		session, err = p2p.Dial(*connect, identity, peerIdentity)
-	}
-	if err != nil {
-		log.Fatalf("p2p: %v", err)
-	}
-	log.Println("handshake complete — session authenticated and encrypted")
-
+	// Receive loop: on disconnect, reconnect and resume.
 	go func() {
-		defer session.Close()
 		for {
-			msg, err := session.Recv()
+			mu.Lock()
+			s := session
+			mu.Unlock()
+
+			msg, err := s.Recv()
 			if err != nil {
-				return
+				log.Printf("peer disconnected: %v", err)
+				s.Close()
+				newSession := dial() // block outside the lock so send loop isn't stuck
+				mu.Lock()
+				session = newSession
+				mu.Unlock()
+				continue
 			}
 			recv <- msg
 		}
 	}()
 
+	// Send loop: always sends on the current session.
 	go func() {
 		for msg := range send {
-			if err := session.Send(msg); err != nil {
-				return
+			mu.Lock()
+			s := session
+			mu.Unlock()
+
+			if err := s.Send(msg); err != nil {
+				log.Printf("send error: %v", err)
 			}
 		}
 	}()
@@ -85,12 +117,4 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func defaultIdentityPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".p2p-chat-identity.key"
-	}
-	return filepath.Join(home, ".p2p-chat", "identity.key")
 }

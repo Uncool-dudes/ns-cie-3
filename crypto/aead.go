@@ -37,6 +37,32 @@ func Encrypt(key [32]byte, plaintext []byte) ([]byte, error) {
 	return frame, nil
 }
 
+// WriteFrame writes a plain (unencrypted) length-prefixed frame to w.
+// Same framing as Encrypt so the relay can handle both modes uniformly.
+func WriteFrame(w io.Writer, data []byte) error {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(data)
+	return err
+}
+
+// ReadFrame reads one plain (unencrypted) length-prefixed frame from r.
+func ReadFrame(r io.Reader) ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	bodyLen := binary.BigEndian.Uint32(lenBuf[:])
+	buf := make([]byte, bodyLen)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 // Decrypt reads one frame from r and returns the plaintext.
 func Decrypt(key [32]byte, r io.Reader) ([]byte, error) {
 	var lenBuf [4]byte
