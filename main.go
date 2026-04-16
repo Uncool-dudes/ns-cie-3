@@ -77,6 +77,10 @@ func main() {
 		session = dial()
 	)
 
+	systemMsg := func(text string) chat.Message {
+		return chat.Message{Sender: "_system", Content: text, Time: time.Now()}
+	}
+
 	// Receive loop: on disconnect, reconnect and resume.
 	go func() {
 		for {
@@ -88,10 +92,12 @@ func main() {
 			if err != nil {
 				log.Printf("peer disconnected: %v", err)
 				s.Close()
+				recv <- systemMsg("Peer disconnected. Waiting for reconnect...")
 				newSession := dial() // block outside the lock so send loop isn't stuck
 				mu.Lock()
 				session = newSession
 				mu.Unlock()
+				recv <- systemMsg("Peer reconnected.")
 				continue
 			}
 			recv <- msg

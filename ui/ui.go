@@ -170,6 +170,11 @@ func (m Model) renderMessages() string {
 
 	var sb strings.Builder
 	for _, msg := range m.messages {
+		if msg.Sender == "_system" {
+			sb.WriteString(statusStyle.Render("  ⟳ "+msg.Content) + "\n\n")
+			continue
+		}
+
 		ts := timestampStyle.Render(msg.Time.Format("15:04"))
 		isMine := msg.Sender == m.username
 
